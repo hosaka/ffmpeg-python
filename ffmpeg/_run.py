@@ -129,6 +129,9 @@ def _get_output_args(node, stream_name_map):
         args += ['-f', kwargs.pop('format')]
     if 'video_bitrate' in kwargs:
         args += ['-b:v', str(kwargs.pop('video_bitrate'))]
+    if 'audio_disable' in kwargs:
+        if kwargs.pop('audio_disable') is True:
+            args += ['-an']
     if 'audio_bitrate' in kwargs:
         args += ['-b:a', str(kwargs.pop('audio_bitrate'))]
     if 'video_size' in kwargs:
@@ -140,6 +143,45 @@ def _get_output_args(node, stream_name_map):
     args += [filename]
     return args
 
+def _get_frame_size(stream_spec):
+    nodes = get_stream_spec_nodes(stream_spec)
+    sorted_nodes, outgoing_edge_maps = topo_sort(nodes)
+
+    # calculate from the output stream
+    output_node = next(node for node in sorted_nodes if isinstance(node, OutputNode))
+    kwargs = copy.copy(output_node.kwargs)
+
+    width = 0
+    height = 0
+
+    if 'video_size' in kwargs:
+        width, height = kwargs.pop('video_size')
+        pix_fmt = kwargs.pop('pix_fmt')
+
+    else:
+        # probe the input stream instead
+        from ._probe import probe
+        input_node = next(node for node in sorted_nodes if isinstance(node, InputNode))
+        kwargs = copy.copy(input_node.kwargs)
+
+        filename = str(input_node.kwargs.pop('filename'))
+
+        probe = probe(filename)
+        video_info = next(s for s in probe['streams'] if s['codec_type'] == 'video')
+        width = int(video_info['width'])
+        height = int(video_info['height'])
+        pix_fmt = str(video_info['pix_fmt'])
+
+    if pix_fmt == 'yuvj420p':
+        depth = 3
+    elif pix_fmt == 'rgb24':
+        depth = 3
+    elif pix_fmt == 'gray':
+        depth = 1
+    else:
+        depth = 3
+
+    return width * height * depth
 
 @output_operator()
 def get_args(stream_spec, overwrite_output=False):
@@ -213,9 +255,33 @@ def run(
     return out, err
 
 
+@output_operator(name='stream')
+def stream(stream_spec, cmd='ffmpeg', capture_stderr=False, input=None, quiet=False, overwrite_output=False):
+    """ Invoke ffmpeg for the supplied node graph, streaming frame by frame.
+
+    """
+    args = compile(stream_spec, cmd, overwrite_output=overwrite_output)
+
+    # calculate framezie
+    framesize = _get_frame_size(stream_spec, args)
+
+    stdin_stream = subprocess.PIPE if input else None
+    stdout_stream = subprocess.PIPE
+    stderr_stream = subprocess.PIPE if capture_stderr or quiet else None
+    p = subprocess.Popen(args, stdin=stdin_stream, stdout=stdout_stream, stderr=stderr_stream)
+
+    while p.poll() is None:
+        yield _read_frame(p, framesize)
+
+
+def _read_frame(process, framesize):
+    return process.stdout.read(framesize)
+
+
 __all__ = [
     'compile',
     'Error',
     'get_args',
     'run',
+    'stream'
 ]
